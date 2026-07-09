@@ -151,8 +151,8 @@ class DroneParams:
 class FormationParams:
     rate_hz: float = 30.0
     task_duration: float = 40.0
-    control_gains: np.ndarray = field(default_factory=lambda: np.array([1.4, 1.4, 1.0, 1.2, 1.0, 1.0], dtype=float))
-    control_limits: np.ndarray = field(default_factory=lambda: np.array([0.55, 0.55, 0.10, 0.35, 0.30, 0.30], dtype=float))
+    control_gains: np.ndarray = field(default_factory=lambda: np.array([1.4, 1.4, 1.0, 0.0, 0.0, 0.0], dtype=float))
+    control_limits: np.ndarray = field(default_factory=lambda: np.array([0.55, 0.55, 0.10, 0.00, 0.00, 0.00], dtype=float))
     obstacle_center: np.ndarray = field(default_factory=lambda: np.array([-0.2, 0.425], dtype=float))
     obstacle_radius: float = 0.15
     obstacle_influence_radius: float = 0.50
@@ -187,8 +187,8 @@ class FormationController:
         self.formation_params = FormationParams()
         self.dt = 1.0 / self.formation_params.rate_hz
 
-        self.prev_limo_velocity_reference = np.zeros(2, dtype=float)
-        self.prev_drone_velocity_reference = np.zeros(4, dtype=float)
+        self.prev_limo_velocity_reference: Optional[np.ndarray] = None
+        self.prev_drone_velocity_reference: Optional[np.ndarray] = None
 
         self.logs: Dict[str, List[np.ndarray]] = {
             "time": [],
@@ -206,7 +206,7 @@ class FormationController:
             velocity=np.zeros(2, dtype=float),
         )
         self.drone_state = DroneState(
-            pose=np.array([0.4, 0.05, 0.0, 0.0], dtype=float),
+            pose=np.array([0.4, 0.05, 1.5, 0.0], dtype=float),
             body_velocity=np.zeros(4, dtype=float),
         )
 
@@ -360,8 +360,18 @@ class FormationController:
 
         delta = q[:2] - self.formation_params.obstacle_center
         distance = float(np.linalg.norm(delta))
-        if distance < 1e-6 or distance >= self.formation_params.obstacle_influence_radius:
+        influence = self.formation_params.obstacle_influence_radius
+        if distance < 1e-6 or distance >= influence:
             return secondary, distance
+
+        # Subtarefa de desvio de obstaculo (prioridade sobre a formacao), com
+        # ativacao suave para evitar chattering na fronteira da zona de influencia.
+        # h vai de 0 (na fronteira) a 1 (no raio fisico do obstaculo).
+        radius = self.formation_params.obstacle_radius
+        activation = (influence - distance) / max(influence - radius, 1e-6)
+        activation = float(np.clip(activation, 0.0, 1.0))
+        # Suavizacao (smoothstep) para transicao continua e derivada nula nas bordas.
+        activation = activation * activation * (3.0 - 2.0 * activation)
 
         normal = delta / distance
         j_obs = np.zeros((1, 6), dtype=float)
@@ -370,13 +380,18 @@ class FormationController:
 
         scalar_speed = min(
             self.formation_params.obstacle_speed_limit,
-            self.formation_params.obstacle_gain * (self.formation_params.obstacle_influence_radius - distance),
+            self.formation_params.obstacle_gain * (influence - distance),
         )
         j_norm_sq = float((j_obs @ j_obs.T)[0, 0])
-        j_pinv = j_obs.T / j_norm_sq
+        j_pinv = j_obs.T / j_norm_sq  # (6, 1)
         projector = np.eye(6) - j_pinv @ j_obs
-        primary = (j_pinv[:, 0] * scalar_speed)
-        return primary + projector @ secondary, distance
+        primary = j_pinv.reshape(-1) * scalar_speed
+
+        # Combinacao NSB suave: fora da zona (activation=0) segue a formacao;
+        # ao se aproximar (activation->1) prioriza o desvio no espaco nulo.
+        obstacle_task = primary + projector @ secondary
+        combined = (1.0 - activation) * secondary + activation * obstacle_task
+        return combined, distance
 
     def limo_velocity_reference(self, world_velocity: np.ndarray, yaw: float) -> np.ndarray:
         nu_x, nu_y = world_velocity
@@ -385,7 +400,10 @@ class FormationController:
         return np.array([u_d, omega_d], dtype=float)
 
     def limo_dynamic_controller(self, velocity_reference: np.ndarray, current_velocity: np.ndarray) -> np.ndarray:
-        derivative = (velocity_reference - self.prev_limo_velocity_reference) / self.dt
+        if self.prev_limo_velocity_reference is None:
+            derivative = np.zeros_like(velocity_reference)
+        else:
+            derivative = (velocity_reference - self.prev_limo_velocity_reference) / self.dt
         self.prev_limo_velocity_reference = velocity_reference.copy()
         drift = self.limo_params.drift(current_velocity)
         command = self.limo_params.input_matrix_inverse @ (
@@ -394,7 +412,10 @@ class FormationController:
         return np.clip(command, -self.limo_params.command_limits, self.limo_params.command_limits)
 
     def drone_dynamic_controller(self, velocity_reference: np.ndarray) -> np.ndarray:
-        derivative = (velocity_reference - self.prev_drone_velocity_reference) / self.dt
+        if self.prev_drone_velocity_reference is None:
+            derivative = np.zeros_like(velocity_reference)
+        else:
+            derivative = (velocity_reference - self.prev_drone_velocity_reference) / self.dt
         self.prev_drone_velocity_reference = velocity_reference.copy()
         current_velocity = self.drone_state.body_velocity
         command = self.drone_params.ku_inverse @ (

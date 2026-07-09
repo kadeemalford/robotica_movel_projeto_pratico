@@ -15,11 +15,14 @@ env/
 .ruff_cache/
 
 # Local experiment outputs
-resultados/
+python/resultados/
+matlab/resultados/
 *.npz
+*.mat
 *.png
 *.pdf
 *.csv
+*.asv
 
 # Editors and OS files
 .vscode/
