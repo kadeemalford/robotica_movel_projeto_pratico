@@ -155,9 +155,9 @@ class FormationParams:
     control_limits: np.ndarray = field(default_factory=lambda: np.array([0.55, 0.55, 0.10, 0.00, 0.00, 0.00], dtype=float))
     obstacle_center: np.ndarray = field(default_factory=lambda: np.array([-0.2, 0.425], dtype=float))
     obstacle_radius: float = 0.15
-    obstacle_influence_radius: float = 0.50
-    obstacle_gain: float = 1.6
-    obstacle_speed_limit: float = 0.5
+    obstacle_influence_radius: float = 0.60
+    obstacle_gain: float = 3.0
+    obstacle_speed_limit: float = 0.7
 
 
 @dataclass

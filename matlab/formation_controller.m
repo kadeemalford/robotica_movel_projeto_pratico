@@ -18,6 +18,12 @@
 % O log salvo em .mat usa os mesmos nomes principais do pipeline Python:
 %   time, formation_state, formation_reference, limo_pose, drone_pose,
 %   limo_command, drone_command, obstacle_distance.
+%
+% Teste com apenas um robo (modo ROS):
+%   - config.ros.only_limo = true: usa apenas o LIMO real, drone simulado
+%   - config.ros.only_bebop = true: usa apenas o Bebop real, LIMO simulado
+%   - Se ambos forem false (padrao): ambos os robos devem estar conectados
+%   - Se ambos forem true: equivalente a ambos false (requer os dois)
 
 if ~exist('config', 'var') || ~isstruct(config)
     config = default_config();
@@ -46,12 +52,14 @@ function cfg = default_config()
 
     cfg.ros = struct();
     cfg.ros.master_uri = 'http://192.168.0.100:11311';
-    cfg.ros.pose_prefix = '/vrpn_client_node';
+    cfg.ros.pose_prefix = '/natnet_ros';
     cfg.ros.limo_ns = 'L1';
     cfg.ros.drone_ns = 'B1';
     cfg.ros.pose_timeout_s = 0.50;
     cfg.ros.takeoff_delay_s = 3.0;
     cfg.ros.reinitialize = false;
+    cfg.ros.only_limo = true;
+    cfg.ros.only_bebop = false;
 
     cfg.initial = struct();
     cfg.initial.limo_pose = [0.4, -0.25, 0.0];
@@ -60,10 +68,16 @@ function cfg = default_config()
     cfg.limo = struct();
     cfg.limo.a = 0.10;
     cfg.limo.theta = [0.1521, 0.0953, 0.0031, 0.9840, -0.0451, 1.6422];
-    cfg.limo.kinematic_gains = [1.4, 1.4];
-    cfg.limo.kinematic_limits = [0.45, 0.45];
+    cfg.limo.kinematic_gains = [1.2, 1.2];
+    cfg.limo.kinematic_limits = [0.30, 0.30];
     cfg.limo.dynamic_gains = diag([2.2, 2.0]);
-    cfg.limo.command_limits = [1.2, 2.5];
+    cfg.limo.command_limits = [1.0, 1.5];
+    % Tipo de comando enviado ao LIMO:
+    %   'velocity': envia a referencia cinematica (u, omega) direto no cmd_vel.
+    %               Correto para o LIMO real, cujo cmd_vel espera VELOCIDADE.
+    %   'dynamic' : aplica o controlador dinamico (comportamento antigo).
+    %               Use apenas se o driver do robo aceitar torque/aceleracao.
+    cfg.limo.command_type = 'velocity';
 
     cfg.drone = struct();
     cfg.drone.ku = diag([0.8417, 0.8354, 3.9660, 9.8524]);
@@ -75,13 +89,13 @@ function cfg = default_config()
     cfg.drone.yaw_reference = 0.0;
 
     cfg.formation = struct();
-    cfg.formation.control_gains = [1.4, 1.4, 1.0, 0.0, 0.0, 0.0];
-    cfg.formation.control_limits = [0.55, 0.55, 0.10, 0.00, 0.00, 0.00];
+    cfg.formation.control_gains = [1.2, 1.2, 1.0, 0.0, 0.0, 0.0];
+    cfg.formation.control_limits = [0.25, 0.25, 0.10, 0.00, 0.00, 0.00];
     cfg.formation.obstacle_center = [-0.2, 0.425];
     cfg.formation.obstacle_radius = 0.15;
-    cfg.formation.obstacle_influence_radius = 0.50;
-    cfg.formation.obstacle_gain = 1.6;
-    cfg.formation.obstacle_speed_limit = 0.5;
+    cfg.formation.obstacle_influence_radius = 0.60;
+    cfg.formation.obstacle_gain = 3.0;
+    cfg.formation.obstacle_speed_limit = 0.7;
 end
 
 function result = run_formation_controller(cfg)
@@ -106,7 +120,7 @@ function result = run_formation_controller(cfg)
     try
         if strcmp(cfg.mode, 'ros')
             ros_io = setup_ros_io(cfg);
-            if cfg.takeoff
+            if cfg.takeoff && ros_io.use_drone
                 publish_empty_message(ros_io.takeoff_pub);
                 did_takeoff = true;
                 pause(cfg.ros.takeoff_delay_s);
@@ -150,7 +164,7 @@ function result = run_formation_controller(cfg)
 
     if strcmp(cfg.mode, 'ros')
         publish_zero_commands(ros_io);
-        if cfg.land_on_finish && did_takeoff
+        if cfg.land_on_finish && did_takeoff && ros_io.use_drone
             pause(0.25);
             publish_empty_message(ros_io.land_pub);
         end
@@ -170,7 +184,7 @@ function result = run_formation_controller(cfg)
                 metrics = compute_metrics_from_logs(logs);
                 print_metrics(metrics);
                 metrics_path = save_metrics_csv(metrics, save_info.output_dir);
-                export_results(logs, save_info.output_dir, cfg.show_figures);
+                export_results(logs, save_info.output_dir, cfg.show_figures, cfg.formation);
                 fprintf('Metricas salvas em %s\n', metrics_path);
             catch plot_exception
                 warning('formation_controller:plotResultsFailed', ...
@@ -211,6 +225,14 @@ function cfg = normalize_config(cfg)
     cfg.show_figures = logical(cfg.show_figures);
     cfg.save_logs = logical(cfg.save_logs);
     cfg.analyze_logs = logical(cfg.analyze_logs);
+    cfg.ros.only_limo = logical(cfg.ros.only_limo);
+    cfg.ros.only_bebop = logical(cfg.ros.only_bebop);
+
+    cfg.limo.command_type = char(lower(string(cfg.limo.command_type)));
+    if ~ismember(cfg.limo.command_type, {'velocity', 'dynamic'})
+        error('formation_controller:invalidLimoCommandType', ...
+              'config.limo.command_type deve ser ''velocity'' ou ''dynamic''.');
+    end
 end
 
 function merged = merge_structs(base, overrides)
@@ -328,13 +350,33 @@ function ros_io = setup_ros_io(cfg)
         end
     end
 
+    use_limo = ~cfg.ros.only_bebop;
+    use_drone = ~cfg.ros.only_limo;
+
     ros_io = struct();
-    ros_io.pose_limo_sub = rossubscriber(sprintf('%s/%s/pose', cfg.ros.pose_prefix, cfg.ros.limo_ns), 'geometry_msgs/PoseStamped');
-    ros_io.pose_drone_sub = rossubscriber(sprintf('%s/%s/pose', cfg.ros.pose_prefix, cfg.ros.drone_ns), 'geometry_msgs/PoseStamped');
-    ros_io.cmd_limo_pub = rospublisher(sprintf('/%s/cmd_vel', cfg.ros.limo_ns), 'geometry_msgs/Twist');
-    ros_io.cmd_drone_pub = rospublisher(sprintf('/%s/cmd_vel', cfg.ros.drone_ns), 'geometry_msgs/Twist');
-    ros_io.takeoff_pub = rospublisher(sprintf('/%s/takeoff', cfg.ros.drone_ns), 'std_msgs/Empty');
-    ros_io.land_pub = rospublisher(sprintf('/%s/land', cfg.ros.drone_ns), 'std_msgs/Empty');
+    ros_io.use_limo = use_limo;
+    ros_io.use_drone = use_drone;
+    
+    if use_limo
+        ros_io.pose_limo_sub = rossubscriber(sprintf('%s/%s/pose', cfg.ros.pose_prefix, cfg.ros.limo_ns), 'geometry_msgs/PoseStamped');
+        ros_io.cmd_limo_pub = rospublisher(sprintf('/%s/cmd_vel', cfg.ros.limo_ns), 'geometry_msgs/Twist');
+    else
+        ros_io.pose_limo_sub = [];
+        ros_io.cmd_limo_pub = [];
+    end
+    
+    if use_drone
+        ros_io.pose_drone_sub = rossubscriber(sprintf('%s/%s/pose', cfg.ros.pose_prefix, cfg.ros.drone_ns), 'geometry_msgs/PoseStamped');
+        ros_io.cmd_drone_pub = rospublisher(sprintf('/%s/cmd_vel', cfg.ros.drone_ns), 'geometry_msgs/Twist');
+        ros_io.takeoff_pub = rospublisher(sprintf('/%s/takeoff', cfg.ros.drone_ns), 'std_msgs/Empty');
+        ros_io.land_pub = rospublisher(sprintf('/%s/land', cfg.ros.drone_ns), 'std_msgs/Empty');
+    else
+        ros_io.pose_drone_sub = [];
+        ros_io.cmd_drone_pub = [];
+        ros_io.takeoff_pub = [];
+        ros_io.land_pub = [];
+    end
+    
     ros_io.last_limo_pose = [];
     ros_io.last_drone_pose = [];
     ros_io.last_limo_stamp = [];
@@ -349,49 +391,83 @@ end
 function [state, ros_io, ready] = update_state_from_ros(state, ros_io, cfg)
     ready = false;
     now_s = posixtime(datetime('now'));
-    limo_msg = get_latest_message(ros_io.pose_limo_sub);
-    drone_msg = get_latest_message(ros_io.pose_drone_sub);
-    if isempty(limo_msg) || isempty(drone_msg)
-        return;
+    
+    % Obtem mensagens apenas dos robos ativos
+    limo_msg = [];
+    drone_msg = [];
+    
+    if ros_io.use_limo
+        limo_msg = get_latest_message(ros_io.pose_limo_sub);
+        if isempty(limo_msg)
+            return;
+        end
+    end
+    
+    if ros_io.use_drone
+        drone_msg = get_latest_message(ros_io.pose_drone_sub);
+        if isempty(drone_msg)
+            return;
+        end
     end
 
-    limo_stamp = get_message_stamp_seconds(limo_msg, now_s);
-    drone_stamp = get_message_stamp_seconds(drone_msg, now_s);
-    if (now_s - limo_stamp) > cfg.ros.pose_timeout_s || (now_s - drone_stamp) > cfg.ros.pose_timeout_s
-        return;
+    % Valida timestamps apenas dos robos ativos
+    if ros_io.use_limo
+        limo_stamp = get_message_stamp_seconds(limo_msg, now_s);
+        if (now_s - limo_stamp) > cfg.ros.pose_timeout_s
+            return;
+        end
+    end
+    
+    if ros_io.use_drone
+        drone_stamp = get_message_stamp_seconds(drone_msg, now_s);
+        if (now_s - drone_stamp) > cfg.ros.pose_timeout_s
+            return;
+        end
     end
 
-    limo_pose = pose_stamped_to_limo_pose(limo_msg);
-    drone_pose = pose_stamped_to_drone_pose(drone_msg);
-
-    if ~isempty(ros_io.last_limo_pose) && ~isempty(ros_io.last_limo_stamp)
-        dt_pose = max(limo_stamp - ros_io.last_limo_stamp, 1.0e-3);
-        cp_now = limo_control_point_from_pose(limo_pose, cfg.limo.a);
-        cp_prev = limo_control_point_from_pose(ros_io.last_limo_pose, cfg.limo.a);
-        cp_vel = (cp_now - cp_prev) / dt_pose;
-        yaw = limo_pose(3);
-        u = cp_vel(1) * cos(yaw) + cp_vel(2) * sin(yaw);
-        omega = (-cp_vel(1) * sin(yaw) + cp_vel(2) * cos(yaw)) / cfg.limo.a;
-        state.limo.velocity = [u, omega];
+    % Atualiza pose e velocidade do LIMO se estiver ativo
+    if ros_io.use_limo
+        limo_pose = pose_stamped_to_limo_pose(limo_msg);
+        
+        if ~isempty(ros_io.last_limo_pose) && ~isempty(ros_io.last_limo_stamp)
+            dt_pose = max(limo_stamp - ros_io.last_limo_stamp, 1.0e-3);
+            cp_now = limo_control_point_from_pose(limo_pose, cfg.limo.a);
+            cp_prev = limo_control_point_from_pose(ros_io.last_limo_pose, cfg.limo.a);
+            cp_vel = (cp_now - cp_prev) / dt_pose;
+            yaw = limo_pose(3);
+            u = cp_vel(1) * cos(yaw) + cp_vel(2) * sin(yaw);
+            omega = (-cp_vel(1) * sin(yaw) + cp_vel(2) * cos(yaw)) / cfg.limo.a;
+            state.limo.velocity = [u, omega];
+        end
+        
+        state.limo.pose = limo_pose;
+        ros_io.last_limo_pose = limo_pose;
+        ros_io.last_limo_stamp = limo_stamp;
     end
 
-    if ~isempty(ros_io.last_drone_pose) && ~isempty(ros_io.last_drone_stamp)
-        dt_pose = max(drone_stamp - ros_io.last_drone_stamp, 1.0e-3);
-        world_velocity = (drone_pose - ros_io.last_drone_pose) / dt_pose;
-        state.drone.body_velocity = (rotation_world_from_body(drone_pose(4)) \ world_velocity.').';
+    % Atualiza pose e velocidade do drone se estiver ativo
+    if ros_io.use_drone
+        drone_pose = pose_stamped_to_drone_pose(drone_msg);
+        
+        if ~isempty(ros_io.last_drone_pose) && ~isempty(ros_io.last_drone_stamp)
+            dt_pose = max(drone_stamp - ros_io.last_drone_stamp, 1.0e-3);
+            world_velocity = (drone_pose - ros_io.last_drone_pose) / dt_pose;
+            state.drone.body_velocity = (rotation_world_from_body(drone_pose(4)) \ world_velocity.').';
+        end
+        
+        state.drone.pose = drone_pose;
+        ros_io.last_drone_pose = drone_pose;
+        ros_io.last_drone_stamp = drone_stamp;
     end
 
-    state.limo.pose = limo_pose;
-    state.drone.pose = drone_pose;
-    ros_io.last_limo_pose = limo_pose;
-    ros_io.last_drone_pose = drone_pose;
-    ros_io.last_limo_stamp = limo_stamp;
-    ros_io.last_drone_stamp = drone_stamp;
     ready = true;
 end
 
 function msg = get_latest_message(sub)
     msg = [];
+    if isempty(sub)
+        return;
+    end
     try
         msg = sub.LatestMessage;
         if isempty(msg)
@@ -439,7 +515,14 @@ function [commands, prev_refs] = compute_commands(state, cfg, prev_refs, dt, t)
     [formation_velocity, obstacle_distance] = formation_outer_loop(qd, qd_dot, q, cfg.formation);
 
     limo_reference = limo_velocity_reference(formation_velocity(1:2), state.limo.pose(3), cfg.limo.a);
-    [limo_command, prev_refs.limo] = limo_dynamic_controller(limo_reference, state.limo.velocity, prev_refs.limo, dt, cfg.limo);
+    if strcmp(cfg.limo.command_type, 'dynamic')
+        [limo_command, prev_refs.limo] = limo_dynamic_controller(limo_reference, state.limo.velocity, prev_refs.limo, dt, cfg.limo);
+    else
+        % 'velocity': envia a referencia cinematica direto, apenas saturando
+        % nos limites de comando. Correto para o cmd_vel do LIMO real.
+        limo_command = clamp_symmetric(limo_reference, cfg.limo.command_limits);
+        prev_refs.limo = limo_reference;
+    end
 
     drone_target_position = drone_desired_position(qd);
     drone_position_error = drone_target_position - state.drone.pose(1:3);
@@ -624,27 +707,37 @@ function state = step_simulation(state, cfg, commands, dt)
 end
 
 function publish_ros_commands(ros_io, commands)
-    limo_msg = rosmessage(ros_io.cmd_limo_pub);
-    limo_msg.Linear.X = commands.limo_command(1);
-    limo_msg.Angular.Z = commands.limo_command(2);
-    send(ros_io.cmd_limo_pub, limo_msg);
+    if ros_io.use_limo
+        limo_msg = rosmessage(ros_io.cmd_limo_pub);
+        limo_msg.Linear.X = commands.limo_command(1);
+        limo_msg.Angular.Z = commands.limo_command(2);
+        send(ros_io.cmd_limo_pub, limo_msg);
+    end
 
-    drone_msg = rosmessage(ros_io.cmd_drone_pub);
-    drone_msg.Linear.X = commands.drone_command(1);
-    drone_msg.Linear.Y = commands.drone_command(2);
-    drone_msg.Linear.Z = commands.drone_command(3);
-    drone_msg.Angular.Z = commands.drone_command(4);
-    send(ros_io.cmd_drone_pub, drone_msg);
+    if ros_io.use_drone
+        drone_msg = rosmessage(ros_io.cmd_drone_pub);
+        drone_msg.Linear.X = commands.drone_command(1);
+        drone_msg.Linear.Y = commands.drone_command(2);
+        drone_msg.Linear.Z = commands.drone_command(3);
+        drone_msg.Angular.Z = commands.drone_command(4);
+        send(ros_io.cmd_drone_pub, drone_msg);
+    end
 end
 
 function publish_zero_commands(ros_io)
     if isempty(ros_io)
         return;
     end
-    limo_msg = rosmessage(ros_io.cmd_limo_pub);
-    drone_msg = rosmessage(ros_io.cmd_drone_pub);
-    send(ros_io.cmd_limo_pub, limo_msg);
-    send(ros_io.cmd_drone_pub, drone_msg);
+    
+    if ros_io.use_limo
+        limo_msg = rosmessage(ros_io.cmd_limo_pub);
+        send(ros_io.cmd_limo_pub, limo_msg);
+    end
+    
+    if ros_io.use_drone
+        drone_msg = rosmessage(ros_io.cmd_drone_pub);
+        send(ros_io.cmd_drone_pub, drone_msg);
+    end
 end
 
 function wait_for_next_sample(cfg, dt, completed_samples, loop_clock)
@@ -779,14 +872,14 @@ function csv_path = save_metrics_csv(metrics, output_dir)
     end
 end
 
-function export_results(logs, output_dir, show)
+function export_results(logs, output_dir, show, formation)
     plot_trajectory_xy(logs, output_dir, show);
     plot_altitude(logs, output_dir, show);
     plot_formation_variables(logs, output_dir, show);
     plot_formation_errors(logs, output_dir, show);
     plot_limo_commands(logs, output_dir, show);
     plot_drone_commands(logs, output_dir, show);
-    plot_obstacle_distance(logs, output_dir, show);
+    plot_obstacle_distance(logs, output_dir, show, formation);
 end
 
 function plot_trajectory_xy(logs, output_dir, show)
@@ -886,13 +979,13 @@ function plot_drone_commands(logs, output_dir, show)
     save_figure(fig, fullfile(output_dir, '06_comandos_drone.png'), show);
 end
 
-function plot_obstacle_distance(logs, output_dir, show)
+function plot_obstacle_distance(logs, output_dir, show, formation)
     t = logs.time(:);
     fig = figure('Visible', bool_to_onoff(show));
     hold on;
     plot(t, logs.obstacle_distance(:), 'DisplayName', 'distancia ao obstaculo');
-    yline(0.50, '--', 'Color', [0.85 0.45 0], 'DisplayName', 'zona influencia');
-    yline(0.15, ':', 'Color', [0.75 0.0 0.0], 'DisplayName', 'raio obstaculo');
+    yline(formation.obstacle_influence_radius, '--', 'Color', [0.85 0.45 0], 'DisplayName', 'zona influencia');
+    yline(formation.obstacle_radius, ':', 'Color', [0.75 0.0 0.0], 'DisplayName', 'raio obstaculo');
     hold off;
     title('Distancia ao obstaculo');
     xlabel('tempo [s]');
